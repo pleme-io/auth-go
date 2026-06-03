@@ -80,6 +80,83 @@ resolver := shikumiakeyless.FromBootstrap(getter)
 cfg, _ := shikumi.For[Cfg]("app").Secrets(resolver).Load(ctx)
 ```
 
+## Cloud identity (`CloudIdentityProvider`) — generic, vendor-neutral
+
+The shape behind AWS-IAM / Azure-AD / GCP auth: prove who you are to the cloud
+platform you run on without a long-lived credential. Each family produces a
+single opaque, base64-encoded identity blob an auth backend forwards verbatim.
+The interface is **zero-dep core**; the cloud SDKs (and `akeyless-go-cloud-id`)
+live in the caller's module behind a `CloudIdentityFunc` carrier:
+
+```go
+prov := auth.NewCloudIdentityFunc(auth.CloudAWS, func(ctx context.Context) (string, error) {
+    return aws.GetCloudId() // from akeyless-go-cloud-id, in the caller's module
+})
+// The akeyless leaf signs a fresh blob on every (re-)mint:
+res, _ := akauth.NewResolver(akauth.Credentials{Kind: auth.KindAWSIAM, CloudIdentity: prov})
+```
+
+## In-cluster profile + the base64 quirk
+
+`InClusterProfile` owns the projected service-account JWT mount
+(`DefaultServiceAccountTokenPath`) and the recurring **base64 token quirk**
+(some gateway k8s-auth methods expect the JWT base64-encoded). The zero-dep
+`InClusterResolver` re-reads the rotating token on each mint:
+
+```go
+res := auth.NewInClusterResolver(auth.WithInClusterBase64(true))
+sess, err := res.Resolve(ctx) // ErrNotInCluster if no SA token is mounted
+```
+
+## UID rotation scheduler
+
+Universal-identity tokens rotate on use. `WithRotation` installs the scheduler
+on the `Session`; a long-running tool drives it under lifecycle supervision:
+
+```go
+// the akeyless leaf wires this automatically for KindUniversalIdentity:
+go sess.RotateEvery(ctx) // rotates now, then every Session.RotationInterval
+```
+
+## Access-types + `Profile` (the `--profile` selector)
+
+`AccessType` names the fine-grained shape within an `AuthKind`
+(`universal_identity` / `k8s_via_gateway` / `gcp_audience` / `ca_cert`).
+`Profile` is the credential-free `--profile`/`--gateway-url` selector — including
+the **gateway-config-URL token shape** (`Profile.ConfigURL`).
+
+### FromConfig bridge from a tundra-profile shikumi struct
+
+A tool loads a `tundra-profile`-shaped `auth.Profile` through shikumi, then
+bridges it to a resolver in one call (never re-loading — BOREALIS §3.5):
+
+```go
+prof := root.Profiles[*flagProfile]   // type auth.Profile (shikumi-loaded)
+resolver, err := auth.FromProfile(prof)             // zero-dep paths
+// …or, for the SDK-minting path, carry the per-method material into the leaf:
+res, err := akauth.ResolverFromProfile(prof, accessKey.Expose())
+```
+
+The core `auth.Profile.Config()` projects the credential-free selectors onto the
+existing `Config`; the gated leaf's `CredentialsFromProfile` /
+`CredentialsFromInCluster` carry the per-method material (gcp-audience,
+k8s-auth config name, the SA-JWT) the core deliberately omits.
+
+## Producer credential validation (the inverse verb)
+
+`ProducerCredentialValidator` is the server-side inverse of `AuthResolver`: a
+custom-producer / webhook receiver checks an **inbound** credential against an
+expected identity. The interface is core; the HTTP-backed implementation (posts
+to the akeyless `validate-producer-credentials` endpoint) is the gated leaf's
+`Validator`:
+
+```go
+v := akauth.NewValidator()
+res, err := v.Validate(ctx, auth.ValidationRequest{Credential: inbound, ExpectedAccessID: "p-…"})
+// res.Valid == true iff the inbound creds belong to the expected access-id;
+// a wrong credential is res.Valid=false (nil err); an outage is ErrValidationUnavailable.
+```
+
 ## License
 
 [MIT](LICENSE) © pleme-io

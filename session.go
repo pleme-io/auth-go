@@ -77,6 +77,13 @@ type Session struct {
 
 	mu  sync.Mutex
 	cur Token
+
+	// rotation state (see rotation.go) — additive; nil/zero for non-rotating
+	// methods like api_key. The rotating credential (a UID token) lives here,
+	// inside the session, never in config or a log field (CFG-09).
+	rotate      RotateFunc
+	rotateEvery time.Duration
+	rotated     string
 }
 
 // SessionOption configures a Session at construction (canonical functional-option
@@ -173,7 +180,11 @@ func (s *Session) Snapshot() Status {
 		RefreshSkew: s.skew,
 	}
 	if st.HasToken && !s.cur.Expiry.IsZero() {
-		st.Valid = s.cur.Valid()
+		// Validity is measured against the session's own clock (s.now), not the
+		// real wall clock, so a Snapshot is deterministic under an injected clock
+		// (test parity) and consistent with the skew-aware refresh, which also
+		// uses s.now via Token.expired.
+		st.Valid = now.Before(s.cur.Expiry)
 		if d := s.cur.Expiry.Add(-s.skew).Sub(now); d > 0 {
 			st.RefreshIn = d
 		}

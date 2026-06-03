@@ -78,7 +78,7 @@ func TestBuildAuth_RequiredMaterial(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewResolver: %v", err)
 			}
-			_, err = r.buildAuth()
+			_, err = r.buildAuth(context.Background())
 			if c.wantErr != (err != nil) {
 				t.Fatalf("buildAuth err = %v, wantErr = %v", err, c.wantErr)
 			}

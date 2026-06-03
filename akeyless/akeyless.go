@@ -76,6 +76,21 @@ type Credentials struct {
 	SignedCertChallenge string `yaml:"-" json:"-"`
 	// UIDToken is the rotating universal-identity token.
 	UIDToken string `yaml:"-" json:"-"`
+	// GcpAudience pins the GCP identity-token audience for the gcp-audience
+	// access shape (auth.AccessGCPAudience). Empty uses the gateway/method
+	// default. Maps to the SDK's gcp-audience field on V2Api.Auth.
+	GcpAudience string `yaml:"gcpAudience" json:"gcpAudience"`
+	// SignedCertChallenge above already carries the cert challenge; CACert reuses
+	// the cert path (auth.AccessCACert) — no extra field is needed, the
+	// CertData/SignedCertChallenge pair is the CA-issued material.
+
+	// CloudIdentity, when non-nil, is consulted at mint time for the cloud-id
+	// material of aws_iam/azure_ad/gcp methods, instead of a static CloudID. It
+	// is the auth.CloudIdentityProvider seam (the generic core trait): a tool
+	// wires akeyless-go-cloud-id behind an auth.CloudIdentityFunc and the leaf
+	// signs a fresh identity on every (re-)mint. Static CloudID still works for
+	// callers that pre-computed the blob.
+	CloudIdentity auth.CloudIdentityProvider `yaml:"-" json:"-"`
 	// RefreshSkew is the Session refresh skew. Zero uses auth.DefaultRefreshSkew.
 	RefreshSkew time.Duration `yaml:"refreshSkew" json:"refreshSkew"`
 }
@@ -134,15 +149,45 @@ func (r *Resolver) Kinds() []auth.AuthKind { return []auth.AuthKind{r.kind} }
 
 // Resolve returns the *auth.Session that owns the live token. The Session's
 // MintFunc calls [Resolver.mint], so the bearer value is produced lazily and
-// re-minted at refresh time — and lives only inside the Session (CFG-09).
+// re-minted at refresh time — and lives only inside the Session (CFG-09). For
+// the universal-identity method it additionally installs a rotation scheduler
+// (auth.WithRotation) backed by V2Api.UidRotateToken, so a long-running tool's
+// UID chain stays fresh under its lifecycle supervision.
 func (r *Resolver) Resolve(_ context.Context) (*auth.Session, error) {
-	return auth.NewSession(r.kind, r.mint, auth.WithRefreshSkew(r.skew))
+	opts := []auth.SessionOption{auth.WithRefreshSkew(r.skew)}
+	if r.kind == auth.KindUniversalIdentity {
+		opts = append(opts, auth.WithRotation(r.rotateUID, auth.DefaultRotationInterval))
+	}
+	return auth.NewSession(r.kind, r.mint, opts...)
+}
+
+// rotateUID advances the universal-identity token by calling
+// V2Api.UidRotateToken and returns the next UID token in the chain. It is the
+// auth.RotateFunc the universal-identity Session uses; the new token lives only
+// inside the Session (CFG-09). It also updates this resolver's own UIDToken so
+// the next mint presents the rotated value.
+func (r *Resolver) rotateUID(ctx context.Context) (string, error) {
+	if r.creds.UIDToken == "" {
+		return "", fmt.Errorf("akeyless: universal_identity rotation requires a uid-token")
+	}
+	body := ak.NewUidRotateToken()
+	body.SetUidToken(r.creds.UIDToken)
+	out, _, err := r.client.V2Api.UidRotateToken(ctx).Body(*body).Execute()
+	if err != nil {
+		return "", fmt.Errorf("akeyless: uid-rotate-token: %w", err)
+	}
+	tv, ok := out.GetTokenOk()
+	if !ok || tv == nil || *tv == "" {
+		return "", fmt.Errorf("akeyless: uid-rotate-token: empty token in response")
+	}
+	r.creds.UIDToken = *tv
+	return *tv, nil
 }
 
 // mint performs one V2Api.Auth call for the configured method and parses the
 // resulting token + expiry into an auth.Token.
 func (r *Resolver) mint(ctx context.Context) (auth.Token, error) {
-	body, err := r.buildAuth()
+	body, err := r.buildAuth(ctx)
 	if err != nil {
 		return auth.Token{}, err
 	}
@@ -159,12 +204,19 @@ func (r *Resolver) mint(ctx context.Context) (auth.Token, error) {
 
 // buildAuth assembles the *akeyless.Auth body for the configured method, setting
 // only the fields that method needs. Missing required material is a clear error
-// rather than a confusing server-side 400.
-func (r *Resolver) buildAuth() (*ak.Auth, error) {
+// rather than a confusing server-side 400. It takes ctx so a
+// auth.CloudIdentityProvider can sign a fresh cloud-id on every (re-)mint.
+func (r *Resolver) buildAuth(ctx context.Context) (*ak.Auth, error) {
 	body := ak.NewAuth()
 	body.SetAccessType(r.kind.String())
 	if r.creds.AccessID != "" {
 		body.SetAccessId(r.creds.AccessID)
+	}
+	// Gateway-config-URL token shape: when a gateway base URL is configured, the
+	// SDK transport already targets it; some gateway auth flows additionally
+	// echo the gateway URL in the auth body, so set it when present.
+	if r.creds.GatewayURL != "" {
+		body.SetGatewayUrl(r.creds.GatewayURL)
 	}
 	switch r.kind {
 	case auth.KindAPIKey:
@@ -173,14 +225,28 @@ func (r *Resolver) buildAuth() (*ak.Auth, error) {
 		}
 		body.SetAccessKey(r.creds.AccessKey)
 	case auth.KindAWSIAM, auth.KindAzureAD, auth.KindGCP:
-		if r.creds.CloudID == "" && r.creds.JWT == "" {
+		// Prefer a live CloudIdentityProvider (signs a fresh blob each mint) over
+		// a pre-computed static CloudID; fall back to a static cloud-id or jwt.
+		cloudID := r.creds.CloudID
+		if r.creds.CloudIdentity != nil {
+			id, err := r.creds.CloudIdentity.Identity(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("akeyless: %s cloud-identity: %w", r.kind, err)
+			}
+			cloudID = id
+		}
+		if cloudID == "" && r.creds.JWT == "" {
 			return nil, fmt.Errorf("akeyless: %s requires a cloud-id or jwt", r.kind)
 		}
-		if r.creds.CloudID != "" {
-			body.SetCloudId(r.creds.CloudID)
+		if cloudID != "" {
+			body.SetCloudId(cloudID)
 		}
 		if r.creds.JWT != "" {
 			body.SetJwt(r.creds.JWT)
+		}
+		// gcp-audience access shape: pin the identity-token audience.
+		if r.kind == auth.KindGCP && r.creds.GcpAudience != "" {
+			body.SetGcpAudience(r.creds.GcpAudience)
 		}
 	case auth.KindK8s:
 		if r.creds.K8sServiceAccountToken == "" {
